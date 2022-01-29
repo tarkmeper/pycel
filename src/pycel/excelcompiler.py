@@ -456,15 +456,21 @@ class ExcelCompiler:
             cell_or_range.value = value
 
     def _reset(self, cell):
-        if cell.needs_calc:
-            return
-        self.log.info(f"Resetting {cell.address}")
-        cell.value = None
+        cell_stack = [ cell ]
 
-        if cell in self.dep_graph:
-            for child_cell in self.dep_graph.successors(cell):
-                if child_cell.value is not None:
-                    self._reset(child_cell)
+        while cell_stack:
+            # use iterative version of recursion to prevent exceeding max recursive depth.
+            next_cell = cell_stack.pop()
+            if next_cell.needs_calc:
+                continue
+
+            self.log.info(f"Resetting {next_cell.address}")
+            next_cell.value = None
+
+            if next_cell in self.dep_graph:
+                for child_cell in self.dep_graph.successors(next_cell):
+                    if child_cell.value is not None:
+                        cell_stack.append(child_cell)
 
     def value_tree_str(self, address, indent=0):
         iterative_eval_tracker.inc_iteration_number()
