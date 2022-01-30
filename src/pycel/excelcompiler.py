@@ -409,6 +409,85 @@ class ExcelCompiler:
         nx.draw_networkx_labels(self.dep_graph, pos)
         plt.show()
 
+    def compile(self, inputs, outputs, numba_optimize = False):
+        """
+        This takes an idea from formulas to build a compiled function collapsing all the dependencies.  There are likely
+        ways to generalize this but this can handle a lot of the optimization for a complex calculation.
+
+        inputs and outputs must be lists of CELLs not ranges.
+        """
+        #force the evaluation of all the output cells.
+        for cell in outputs:
+            res = self.evaluate(cell)
+
+        # Do a forward pass to figure out which cells are fed by these inputs.
+        stack = [self.cell_map[address] for address in inputs]
+        input_set = set(stack)
+        forward_set = set()
+        while stack:
+            next_cell = stack.pop()
+
+            if next_cell in forward_set:
+                continue
+            forward_set.add(next_cell)
+
+            for child_cell in self.dep_graph.successors(next_cell):
+                stack.append(child_cell)
+
+        forward_set = forward_set - input_set # remove the inputs from the forward set.
+
+        # rebuild the stack using outputs, we now will iterate backwards looking for nodes that
+        # exist on the backwards set.
+        for address in outputs:
+            cell = self.cell_map[address]
+            assert cell in forward_set # if something is an input it better feed the graph.
+            stack.append( cell )
+
+        backward_map = collections.defaultdict(lambda: 0)
+        code = ""
+        if numba_optimize:
+            code += "from numba import jit\n"
+            code += "@jit\n"
+            print("NUMBA OPTIMIZING ", outputs)
+        code += "def optimized_function(inputs):\n"
+        code += "    C = {}\n"
+        code += "    _C_ = C.__getitem__\n"
+        code += "    C.update(inputs)\n"
+        while stack:
+            next_cell  = stack[-1]
+            stage = backward_map[next_cell]
+
+            if stage == 0:
+                # 0 is the iteration stage where we move backwards grabbing all the predicates of this item.
+                backward_map[next_cell] = 1
+                if next_cell in forward_set:
+                    stack +=  list(self.dep_graph.predecessors(next_cell))
+                    continue # return to processing next element
+                elif next_cell in input_set:
+                    # inputs will already be captured.
+                    backward_map[next_cell] = 2  # this is done no need for more.
+                else:
+                    code += "    C[\"{address}\"] = {value}\n".format(address=next_cell.address, value=next_cell.value)
+                    backward_map[next_cell] = 2 # this is done no need for more.
+
+            if stage == 1:
+                backward_map[next_cell] = 2
+                code += "    C[\"{address}\"] = {code}\n".format(address=next_cell.address, code=next_cell.python_code)
+
+            stack.pop()
+
+        code += "    results = {}\n"
+        for address in outputs:
+            code += "    results[\"{address}\"] = C[\"{address}\"]\n".format(address=address)
+
+        code += "    return results\n"
+        code += ""
+
+        gbls = {}
+        exec(code, gbls) # exec will overrdie
+        return gbls["optimized_function"]
+
+
     def set_value(self, address, value, set_as_range=False):
         """ Set the value of one or more cells or ranges
 
@@ -457,7 +536,6 @@ class ExcelCompiler:
 
     def _reset(self, cell):
         cell_stack = [ cell ]
-
         while cell_stack:
             # use iterative version of recursion to prevent exceeding max recursive depth.
             next_cell = cell_stack.pop()
@@ -471,6 +549,8 @@ class ExcelCompiler:
                 for child_cell in self.dep_graph.successors(next_cell):
                     if child_cell.value is not None:
                         cell_stack.append(child_cell)
+
+
 
     def value_tree_str(self, address, indent=0):
         iterative_eval_tracker.inc_iteration_number()
