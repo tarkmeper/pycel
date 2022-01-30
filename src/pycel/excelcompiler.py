@@ -409,12 +409,15 @@ class ExcelCompiler:
         nx.draw_networkx_labels(self.dep_graph, pos)
         plt.show()
 
-    def compile(self, inputs, outputs, numba_optimize = False):
+    def optimized_compile(self, inputs, outputs, numba_optimize = False):
         """
-        This takes an idea from formulas to build a compiled function collapsing all the dependencies.  There are likely
-        ways to generalize this but this can handle a lot of the optimization for a complex calculation.
+        This takes an idea from cell formulas to build a compiled function collapsing all the dependencies.
+        There are likely ways to generalize this but this can handle a lot of the optimization for a complex calculation.
 
-        inputs and outputs must be lists of CELLs not ranges.
+        Conceptually Numba and other JIT tools should allow opre optimization but I think the function calls rather
+        than local variables will cause this not to work as numba can't infer the types.
+
+        Inputs and Outputs must be lists of CELLs not ranges.
         """
         #force the evaluation of all the output cells.
         for cell in outputs:
@@ -448,11 +451,15 @@ class ExcelCompiler:
         if numba_optimize:
             code += "from numba import jit\n"
             code += "@jit\n"
-            print("NUMBA OPTIMIZING ", outputs)
-        code += "def optimized_function(inputs):\n"
-        code += "    C = {}\n"
-        code += "    _C_ = C.__getitem__\n"
-        code += "    C.update(inputs)\n"
+        code += "def optimized_function(*args):\n"
+        cell_idx = {}
+        range_idx = {}
+
+        for input_idx, address in enumerate(inputs):
+            cell = self.cell_map[address]
+            cell_idx[cell] = len(cell_idx)
+            code += "    C{idx} = args[{input_idx}]\n".format(idx = cell_idx[cell], input_idx = input_idx)
+
         while stack:
             next_cell  = stack[-1]
             stage = backward_map[next_cell]
@@ -467,24 +474,45 @@ class ExcelCompiler:
                     # inputs will already be captured.
                     backward_map[next_cell] = 2  # this is done no need for more.
                 else:
-                    code += "    C[\"{address}\"] = {value}\n".format(address=next_cell.address, value=next_cell.value)
+                    cell_idx[next_cell] = len(cell_idx)
+                    code += "    C{idx} = {value}\n".format(idx=cell_idx[next_cell], value=next_cell.value)
                     backward_map[next_cell] = 2 # this is done no need for more.
 
             if stage == 1:
                 backward_map[next_cell] = 2
-                code += "    C[\"{address}\"] = {code}\n".format(address=next_cell.address, code=next_cell.python_code)
+                python_code = next_cell.python_code
+                if next_cell.address.is_range:
+                    range_idx[next_cell] = len(range_idx)
+                    range_tuple = ( "C{idx}".format(idx=cell_idx[x]) for x in self.dep_graph.predecessors(next_cell) )
+                    code += "    R{idx} = ({range})\n".format(idx=range_idx[next_cell], range=",".join(range_tuple) )
+
+                else:
+                    for pred_cell in self.dep_graph.predecessors(next_cell):
+                        if not pred_cell.address.is_range:
+                            variable_name = "C{idx}".format(idx=cell_idx[pred_cell])
+                            old_name = "_C_(\"{address}\")".format(address=pred_cell.address)
+                        else:
+                            variable_name = "R{idx}".format(idx=range_idx[pred_cell])
+                            old_name = "_R_(\"{address}\")".format(address=pred_cell.address)
+                        python_code = python_code.replace(old_name, variable_name)
+
+                    cell_idx[next_cell] = len(cell_idx)
+                    code += "    C{idx} = {code}\n".format(idx=cell_idx[next_cell], code=python_code)
 
             stack.pop()
 
-        code += "    results = {}\n"
+        code += "    results = (\n"
         for address in outputs:
-            code += "    results[\"{address}\"] = C[\"{address}\"]\n".format(address=address)
-
+            code += "        C{idx},\n".format(idx=cell_idx[self.cell_map[address]])
+        code += "        )\n"
         code += "    return results\n"
         code += ""
 
-        gbls = {}
-        exec(code, gbls) # exec will overrdie
+        gbls = {
+            "sin": math.sin,
+            "sum_": sum,
+        }
+        exec(code, gbls) # exec will create optimized_function
         return gbls["optimized_function"]
 
 
